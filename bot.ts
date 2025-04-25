@@ -972,7 +972,7 @@ bot.command("channel_cast", async (ctx) => {
       }
 
       const spaceIndex = fullText.indexOf(' ');
-      const channelId = fullText.substring(0, spaceIndex);
+      const channelId = fullText.substring(0, spaceIndex).toLowerCase();
       const text = fullText.substring(spaceIndex + 1);
 
       await ctx.reply(`Publishing cast to channel "${channelId}"...`);
