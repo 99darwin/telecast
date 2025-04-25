@@ -1,0 +1,23 @@
+{
+  "name": "telecast",
+  "version": "1.0.0",
+  "main": "bot.ts",
+  "scripts": {
+    "start": "tsx bot.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@farcaster/hub-nodejs": "^0.13.1",
+    "@neynar/nodejs-sdk": "^2.31.0",
+    "dotenv": "^16.5.0",
+    "grammy": "^1.36.1",
+    "ioredis": "^5.6.1",
+    "viem": "^2.28.0"
+  }
+}
