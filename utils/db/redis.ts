@@ -44,9 +44,18 @@ export const db = {
         const users: UserData[] = [];
         
         for (const key of keys) {
-            const data = await redis.get(key);
-            if (data) {
-                users.push(JSON.parse(data));
+            try {
+                if (!key.match(/^user:\d+$/)) {
+                    continue;
+                }
+                
+                const data = await redis.get(key);
+                if (data) {
+                    const parsed = JSON.parse(data);
+                    users.push(parsed);
+                }
+            } catch (error) {
+                console.error(`Error processing Redis key ${key}:`, error);
             }
         }
         
