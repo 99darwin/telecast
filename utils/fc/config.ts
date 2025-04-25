@@ -33,7 +33,7 @@ const getFollowing = async (fid: number, cursor: string = ''): Promise<any[]> =>
     return currentFollowing;
 }
 
-export const getFyFeed = async (fid: number, cursor: string = ''): Promise<any[]> => {
+export const getFyFeed = async (fid: number, cursor: string = ''): Promise<{casts: any[], nextCursor?: string}> => {
     try {
         console.log(`Fetching feed for FID ${fid} with cursor ${cursor}`);
         const feed = await fetch(
@@ -45,7 +45,7 @@ export const getFyFeed = async (fid: number, cursor: string = ''): Promise<any[]
             console.error(`Feed API Error: ${feed.status} ${feed.statusText}`);
             const errorText = await feed.text();
             console.error('Error response:', errorText);
-            return [];
+            return { casts: [] };
         }
 
         const feedData = await feed.json();
@@ -53,58 +53,18 @@ export const getFyFeed = async (fid: number, cursor: string = ''): Promise<any[]
         
         if (!feedData?.casts) {
             console.error('Invalid response:', feedData);
-            return [];
+            return { casts: [] };
         }
         
-        return feedData.casts;
+        return { 
+            casts: feedData.casts,
+            nextCursor: feedData.next?.cursor
+        };
     } catch (error) {
         console.error('Error fetching feed:', error);
-        return [];
+        return { casts: [] };
     }
 }
-
-export const configureClient = async (fid: number): Promise<any[]> => {
-    try {
-        const followingInfo = await getFollowing(fid);
-        console.log(`Found ${followingInfo.length} following`);
-
-        const client = createClient();
-
-        return new Promise((resolve, reject) => {
-            client.$.waitForReady(Date.now() + 5000, async (e) => {
-                if (e) {
-                    reject(e);
-                } else {
-                    console.log(`Connected to ${hubGprcUrl}`);
-                    const allCasts: any[] = [];
-                    try {
-                        for (const following of followingInfo) {
-                            const castsResult = await client.getCastsByFid({
-                                fid: following.fid,
-                            });
-                            castsResult.map((casts) =>
-                                casts.messages.map((cast) =>
-                                    allCasts.push({
-                                        text: cast.data?.castAddBody?.text,
-                                        fid: following.fid,
-                                        pfp_url: following.pfp_url,
-                                        timestamp: cast.data?.timestamp,
-                                    })
-                                )
-                            );
-                        }
-                    } finally {
-                        client.close();
-                    }
-                    resolve(allCasts);
-                }
-            });
-        });
-    } catch (error) {
-        console.error(error);
-        return [];
-    }
-};
 
 // Add new endpoints for signer management
 export const createSigner = async () => {
@@ -191,3 +151,208 @@ export const reactToCast = async (signerUuid: string, castHash: string, reaction
     });
     return response.json();
 };
+
+// Update the function to fetch cast replies with an additional call if needed
+export const getCastWithReplies = async (castHash: string): Promise<any> => {
+    try {
+        // First fetch the cast itself
+        const castResponse = await fetch(
+            `${neynarApiUrl}/farcaster/cast?identifier=${castHash}&type=hash`,
+            neynarHeaders('GET')
+        );
+        
+        if (!castResponse.ok) {
+            console.error(`Cast API Error: ${castResponse.status} ${castResponse.statusText}`);
+            const errorText = await castResponse.text();
+            console.error('Error response:', errorText);
+            return null;
+        }
+        
+        const castData = await castResponse.json();
+        const cast = castData.cast;
+        
+        // If there are replies, fetch them separately
+        if (cast?.replies?.count > 0) {
+            console.log(`Cast ${castHash} has ${cast.replies.count} replies, fetching them...`);
+            
+            // Use the correct parameters for the casts endpoint
+            // According to Neynar API documentation, the parameter is "parent" not "parent_hash"
+            const repliesResponse = await fetch(
+                `${neynarApiUrl}/farcaster/casts?parent=${castHash}&limit=25`,
+                neynarHeaders('GET')
+            );
+            
+            if (!repliesResponse.ok) {
+                console.error(`Replies API Error: ${repliesResponse.status} ${repliesResponse.statusText}`);
+                // Log the error response text to debug the issue
+                const errorText = await repliesResponse.text();
+                console.error('Error response:', errorText);
+                return cast;
+            }
+            
+            const repliesData = await repliesResponse.json();
+            console.log(`Fetched ${repliesData.casts?.length || 0} actual replies for cast ${castHash}`);
+            
+            // Add the replies to the cast object
+            if (repliesData.casts && repliesData.casts.length > 0) {
+                cast.replies.casts = repliesData.casts;
+            }
+        }
+        
+        return cast;
+    } catch (error) {
+        console.error('Error fetching cast with replies:', error);
+        return null;
+    }
+};
+
+// Update function to fetch replies based on thread hash
+export const getCastReplies = async (castHash: string): Promise<any[]> => {
+    try {
+        // First get the cast to get the thread hash
+        const castResponse = await fetch(
+            `${neynarApiUrl}/farcaster/cast?identifier=${castHash}&type=hash`,
+            neynarHeaders('GET')
+        );
+        
+        if (!castResponse.ok) {
+            console.error(`Cast API Error: ${castResponse.status} ${castResponse.statusText}`);
+            return [];
+        }
+        
+        const castData = await castResponse.json();
+        const cast = castData.cast;
+        
+        // If there are no replies, return empty array
+        if (!cast.replies?.count || cast.replies.count === 0) {
+            return [];
+        }
+        
+        console.log(`Cast ${castHash} has ${cast.replies.count} replies, fetching them...`);
+        
+        // Get the thread hash - this is what we need to get replies
+        const threadHash = cast.thread_hash || castHash;
+        
+        // Now fetch the thread to get the replies
+        const threadResponse = await fetch(
+            `${neynarApiUrl}/farcaster/all-casts-in-thread?threadHash=${threadHash}&limit=25`,
+            neynarHeaders('GET')
+        );
+        
+        if (!threadResponse.ok) {
+            console.error(`Thread API Error: ${threadResponse.status} ${threadResponse.statusText}`);
+            return [];
+        }
+        
+        const threadData = await threadResponse.json();
+        console.log(`Thread data retrieved with ${threadData.casts?.length || 0} casts`);
+        
+        // Filter the casts in the thread to only include direct replies to this cast
+        const directReplies = threadData.casts?.filter((c: any) => c.parent_hash === castHash) || [];
+        
+        console.log(`Found ${directReplies.length} direct replies to cast ${castHash}`);
+        
+        return directReplies;
+    } catch (error) {
+        console.error('Error fetching cast replies:', error);
+        return [];
+    }
+};
+
+// Helper function to normalize cast data format from different Neynar endpoints
+export const normalizeCastFormat = (cast: any): any => {
+    if (!cast) return null;
+    
+    // Make sure we have at least the basic fields required by sendCast
+    const normalized = {
+        hash: cast.hash,
+        text: cast.text || '',
+        timestamp: cast.timestamp || new Date().toISOString(),
+        author: {
+            fid: cast.author?.fid,
+            username: cast.author?.username || 'unknown',
+            display_name: cast.author?.display_name || cast.author?.username || 'Unknown',
+            pfp_url: cast.author?.pfp_url || ''
+        },
+        reactions: {
+            likes: cast.reactions?.likes || 0,
+            recasts: cast.reactions?.recasts || 0
+        },
+        replies: {
+            count: cast.replies?.count || 0
+        },
+        embeds: cast.embeds || []
+    };
+    
+    return normalized;
+};
+
+// Function to fetch cast conversation and extract all replies from the correct location
+export const getCastConversation = async (castHash: string): Promise<any[]> => {
+    try {
+        // Use the cast/conversation endpoint
+        const response = await fetch(
+            `${neynarApiUrl}/farcaster/cast/conversation?identifier=${castHash}&type=hash`,
+            neynarHeaders('GET')
+        );
+        
+        if (!response.ok) {
+            console.error(`Conversation API Error: ${response.status} ${response.statusText}`);
+            const errorText = await response.text();
+            console.error('Error response:', errorText);
+            return [];
+        }
+        
+        const data = await response.json();
+        
+        // Based on the exact structure we've seen, extract the direct_replies
+        const directReplies = data.conversation?.cast?.direct_replies || [];
+        
+        console.log(`Found ${directReplies.length} direct replies for cast ${castHash}`);
+        
+        // Also collect any nested replies (replies to replies)
+        const nestedReplies = [];
+        
+        // Check each direct reply for its own direct replies
+        for (const reply of directReplies) {
+            if (reply.direct_replies && reply.direct_replies.length > 0) {
+                console.log(`Found ${reply.direct_replies.length} nested replies for reply ${reply.hash}`);
+                nestedReplies.push(...reply.direct_replies);
+            }
+        }
+        
+        // Combine direct replies and nested replies if needed
+        const allReplies = [...directReplies, ...nestedReplies];
+        console.log(`Total replies found (direct + nested): ${allReplies.length}`);
+        
+        return allReplies;
+    } catch (error) {
+        console.error('Error fetching cast conversation:', error);
+        return [];
+    }
+};
+
+// Function to fetch a single cast by hash with the correct type parameter
+export const getCastByHash = async (castHash: string): Promise<any> => {
+    try {
+        const response = await fetch(
+            `${neynarApiUrl}/farcaster/cast?identifier=${castHash}&type=hash`,
+            neynarHeaders('GET')
+        );
+        
+        if (!response.ok) {
+            console.error(`Cast API Error: ${response.status} ${response.statusText}`);
+            const errorText = await response.text();
+            console.error('Error response:', errorText);
+            return null;
+        }
+        
+        const data = await response.json();
+        return data.cast;
+    } catch (error) {
+        console.error('Error fetching cast by hash:', error);
+        return null;
+    }
+};
+
+

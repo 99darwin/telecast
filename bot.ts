@@ -1,6 +1,6 @@
 import { Bot } from "grammy";
 import { botToken } from "./config";
-import { getFyFeed } from "./utils/fc/config";
+import { getFyFeed, getCastWithReplies, getCastReplies, getCastConversation, getCastByHash } from "./utils/fc/config";
 import { db, redis } from "./utils/db/redis";
 import { createSignedKey, getSignerUUID, verifySignerStatus, checkSigner, resetSigner } from './utils/fc/signer';
 import neynarClient from "./utils/fc/neynarClient";
@@ -128,10 +128,59 @@ async function sendCast(ctx: any, cast: any) {
     }
 }
 
-// Add callback query handler for the buttons
+// Find the existing callback query handler and update it to handle the "load_more" action
 bot.on("callback_query", async (ctx) => {
     try {
-        const [action, castHash] = ctx.callbackQuery?.data?.split(':') as [CastAction, string];
+        const callbackData = ctx.callbackQuery?.data;
+        if (!callbackData) return;
+        
+        // Handle the load_more action
+        if (callbackData.startsWith('load_more:')) {
+            const cursor = callbackData.split(':')[1];
+            await ctx.answerCallbackQuery("Loading more casts...");
+            
+            const user = await db.getUser(ctx.from?.id || 0);
+            if (!user?.fid) {
+                await ctx.reply("No FID found. Please set up your account first with /start");
+                return;
+            }
+            
+            // Fetch the next page of feed
+            const feedResult = await getFyFeed(user.fid, cursor);
+            const casts = feedResult.casts;
+            
+            if (!casts || casts.length === 0) {
+                await ctx.reply("No more casts found.");
+                return;
+            }
+            
+            await ctx.reply("📱 More casts from your feed:");
+            
+            // Send each cast
+            for (const cast of casts) {
+                await sendCast(ctx, cast);
+            }
+            
+            // If there's still more, add another "Load More" button
+            if (feedResult.nextCursor) {
+                await ctx.reply("Want to see more casts?", {
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: "Load More ⬇️", callback_data: `load_more:${feedResult.nextCursor}` }
+                        ]]
+                    }
+                });
+                
+                // Update the cursor in Redis
+                await redis.set(`user:${ctx.from.id}:feed_cursor`, feedResult.nextCursor);
+            } else {
+                await ctx.reply("You've reached the end of your feed!");
+            }
+            return;
+        }
+        
+        // Handle existing cast actions (like, recast, reply)
+        const [action, castHash] = callbackData.split(':') as [CastAction, string];
         const user = await db.getUser(ctx.from?.id || 0);
         
         if (!user?.signerUuid || user.signerStatus !== 'approved') {
@@ -196,7 +245,9 @@ bot.command("feed", async (ctx) => {
         await ctx.reply("Fetching your For You feed...");
         console.log("Fetching feed for FID:", user.fid);
         
-        const casts = await getFyFeed(user.fid);
+        // Get the feed with pagination info
+        const feedResult = await getFyFeed(user.fid);
+        const casts = feedResult.casts;
         console.log("Got casts:", casts?.length);
         
         if (!casts || casts.length === 0) {
@@ -206,8 +257,26 @@ bot.command("feed", async (ctx) => {
         }
 
         await ctx.reply("🔄 Latest casts from your feed:");
-        for (const cast of casts.slice(0, 10)) {
+        
+        // Send each cast
+        for (const cast of casts) {
             await sendCast(ctx, cast);
+        }
+        
+        // If there's a next page, add a "Load More" button
+        if (feedResult.nextCursor) {
+            await ctx.reply("Want to see more casts?", {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: "Load More ⬇️", callback_data: `load_more:${feedResult.nextCursor}` }
+                    ]]
+                }
+            });
+            
+            // Store the cursor in Redis for this user (in case they want to use /more command)
+            await redis.set(`user:${ctx.from?.id}:feed_cursor`, feedResult.nextCursor);
+        } else {
+            await ctx.reply("You've reached the end of your feed!");
         }
     } catch (error) {
         console.error("Error in feed command:", error);
@@ -230,19 +299,59 @@ bot.command("cast", async (ctx) => {
             return;
         }
 
+        // Check if this is a reply to a message with a photo
+        let imageUrl;
+        if (ctx.message?.reply_to_message?.photo) {
+            const photos = ctx.message.reply_to_message.photo;
+            // Get the largest photo (last in array)
+            const fileId = photos[photos.length - 1].file_id;
+            
+            await ctx.reply("Uploading image...");
+            try {
+                // Import the image upload function
+                const { uploadImageFromTelegram } = await import('./utils/ut/ut');
+                imageUrl = await uploadImageFromTelegram(fileId);
+            } catch (error) {
+                console.error("Error uploading image:", error);
+                await ctx.reply("Failed to upload the image, publishing text only.");
+            }
+        }
+
         await ctx.reply("Publishing your cast...");
-        const cast = await neynarClient.publishCast({
+        
+        // Prepare the cast parameters
+        const castParams: any = {
             signerUuid: user.signerUuid,
             text: text
-        });
+        };
+        
+        // Add image embed if available
+        if (imageUrl) {
+            castParams.embeds = [{
+                url: imageUrl
+            }];
+        }
 
-        // Store the cast hash in Redis with timestamp
-        await redis.set(`user:${ctx.from?.id}:cast:${cast.cast.hash}`, JSON.stringify({
+        // Publish the cast
+        const cast = await neynarClient.publishCast(castParams);
+
+        // Store the cast hash in Redis with timestamp and image URL if available
+        const castData: any = {
             text: text,
             timestamp: Date.now()
-        }));
+        };
         
-        await ctx.reply("✅ Cast published successfully!");
+        if (imageUrl) {
+            castData.imageUrl = imageUrl;
+        }
+        
+        await redis.set(`user:${ctx.from?.id}:cast:${cast.cast.hash}`, JSON.stringify(castData));
+        
+        if (imageUrl) {
+            await ctx.reply("✅ Cast with image published successfully!");
+        } else {
+            await ctx.reply("✅ Cast published successfully!");
+        }
     } catch (error) {
         console.error("Error publishing cast:", error);
         await ctx.reply("Sorry, something went wrong while publishing your cast.");
@@ -439,7 +548,6 @@ bot.command("replies", async (ctx) => {
       // Send immediate response to confirm command received
       await ctx.reply("Looking for replies to your casts...");
       
-      // Rest of your existing code to check replies
       const user = await db.getUser(ctx.from?.id || 0);
       console.log("Found user:", user);
       
@@ -463,12 +571,78 @@ bot.command("replies", async (ctx) => {
           return;
       }
       
-      // Rest of your reply checking logic...
+      // Get cast hashes from Redis keys
+      const castHashes = castKeys.map(key => key.split(':').pop());
+      console.log("Cast hashes to check:", castHashes);
+      
       await ctx.reply("Checking replies to your recent casts...");
       
-      // For now, I'm just confirming the command works
-      // You can add back the API calls once confirmed
-      await ctx.reply("Finished checking replies!");
+      let repliesFound = false;
+      let totalReplies = 0;
+      
+      // Check each cast for replies
+      for (const castHash of castHashes) {
+          try {
+              if (!castHash) {
+                  console.log("Invalid cast hash found:", castHash);
+                  continue;
+              }
+              
+              // Get original cast data from Redis
+              const castData = await redis.get(`user:${ctx.from?.id}:cast:${castHash}`);
+              const castInfo = castData ? JSON.parse(castData) : null;
+              
+              // First get the cast to check if it has replies
+              const cast = await getCastByHash(castHash);
+              
+              if (!cast) {
+                  console.log(`No data found for cast ${castHash}`);
+                  continue;
+              }
+              
+              // Now get the conversation if there are replies
+              if (cast.replies?.count > 0) {
+                  console.log(`Cast ${castHash} has ${cast.replies.count} replies, fetching conversation...`);
+                  
+                  const replies = await getCastConversation(castHash);
+                  
+                  if (replies.length > 0) {
+                      repliesFound = true;
+                      totalReplies += replies.length;
+                      
+                      // Show the original cast first
+                      await ctx.reply(`🔍 Found ${replies.length} ${replies.length === 1 ? 'reply' : 'replies'} to your cast:`);
+                      
+                      // Display the original cast text
+                      if (castInfo) {
+                          let originalMsg = `Your original cast (${new Date(castInfo.timestamp).toLocaleString()}):\n`;
+                          originalMsg += `"${castInfo.text}"`;
+                          
+                          if (castInfo.imageUrl) {
+                              originalMsg += " (with image)";
+                          }
+                          
+                          await ctx.reply(originalMsg);
+                      }
+                      
+                      // Display each reply
+                      for (const reply of replies) {
+                          await sendCast(ctx, reply);
+                      }
+                  } else {
+                      console.log(`API reported ${cast.replies.count} replies for cast ${castHash}, but none were found in the response.`);
+                  }
+              }
+          } catch (error) {
+              console.error(`Error checking replies for cast ${castHash}:`, error);
+          }
+      }
+      
+      if (!repliesFound) {
+          await ctx.reply("No replies found to any of your casts.");
+      } else {
+          await ctx.reply(`✅ Found a total of ${totalReplies} ${totalReplies === 1 ? 'reply' : 'replies'} to your casts.`);
+      }
   } catch (error) {
       console.error("Error checking replies:", error);
       await ctx.reply("Sorry, something went wrong while checking replies.");
@@ -519,6 +693,63 @@ bot.command("reset_signer", async (ctx) => {
     console.log("reset_signer command received");
     await resetSigner(ctx.from?.id || 0);
     await ctx.reply("Signer reset successfully!");
+});
+
+bot.command("more", async (ctx) => {
+    console.log("/more command received");
+    try {
+        const user = await db.getUser(ctx.from?.id || 0);
+        if (!user?.fid) {
+            await ctx.reply("No FID found. Please set up your account first with /start");
+            return;
+        }
+        
+        // Get the stored cursor for this user
+        const cursor = await redis.get(`user:${ctx.from?.id}:feed_cursor`);
+        if (!cursor) {
+            await ctx.reply("No more posts available or you haven't fetched your feed yet. Use /feed first.");
+            return;
+        }
+        
+        await ctx.reply("Loading more casts...");
+        
+        // Fetch the next page of feed
+        const feedResult = await getFyFeed(user.fid, cursor);
+        const casts = feedResult.casts;
+        
+        if (!casts || casts.length === 0) {
+            await ctx.reply("No more casts found in your feed.");
+            return;
+        }
+        
+        await ctx.reply("📱 More casts from your feed:");
+        
+        // Send each cast
+        for (const cast of casts) {
+            await sendCast(ctx, cast);
+        }
+        
+        // If there's still more, update the cursor and add another "Load More" button
+        if (feedResult.nextCursor) {
+            await ctx.reply("Want to see more casts?", {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: "Load More ⬇️", callback_data: `load_more:${feedResult.nextCursor}` }
+                    ]]
+                }
+            });
+            
+            // Update the cursor in Redis
+            await redis.set(`user:${ctx.from?.id}:feed_cursor`, feedResult.nextCursor);
+        } else {
+            await ctx.reply("You've reached the end of your feed!");
+            // Clear the cursor since there are no more pages
+            await redis.del(`user:${ctx.from?.id}:feed_cursor`);
+        }
+    } catch (error) {
+        console.error("Error in more command:", error);
+        await ctx.reply("Sorry, something went wrong while fetching more casts.");
+    }
 });
 
 // Message handler OUTSIDE startBot
@@ -685,6 +916,98 @@ bot.on("message", async (ctx) => {
     }
 });
 
+// Modify the photo handler to check for commands in the caption
+bot.on("message:photo", async (ctx) => {
+    console.log("Photo message received");
+    
+    // Check if the caption contains a /cast command
+    if (ctx.message.caption?.startsWith('/cast')) {
+        // Extract the text after the command
+        const text = ctx.message.caption.slice(6).trim();
+        
+        try {
+            const user = await db.getUser(ctx.from?.id || 0);
+            if (!user?.signerUuid || user.signerStatus !== 'approved') {
+                await ctx.reply("You need an approved signer first. Use /start to set one up.");
+                return;
+            }
+            
+            // Get the largest photo (last in the array)
+            const photos = ctx.message.photo;
+            const fileId = photos[photos.length - 1].file_id;
+            
+            await ctx.reply("Uploading image and publishing cast...");
+            
+            // Import the image upload function
+            const { uploadImageFromTelegram } = await import('./utils/ut/ut');
+            const imageUrl = await uploadImageFromTelegram(fileId);
+            
+            // Publish the cast with image
+            const cast = await neynarClient.publishCast({
+                signerUuid: user.signerUuid,
+                text: text,
+                embeds: [{ url: imageUrl }]
+            });
+
+            // Store the cast hash in Redis
+            await redis.set(`user:${ctx.from?.id}:cast:${cast.cast.hash}`, JSON.stringify({
+                text: text,
+                imageUrl: imageUrl,
+                timestamp: Date.now()
+            }));
+            
+            await ctx.reply("✅ Cast with image published successfully!");
+        } catch (error) {
+            console.error("Error publishing cast with image:", error);
+            await ctx.reply("Sorry, something went wrong while publishing your cast with image.");
+        }
+        return;
+    }
+    
+    // Handle regular photo messages with captions (no command)
+    if (ctx.message.caption || ctx.chat.type === "private") {
+        try {
+            const user = await db.getUser(ctx.from?.id || 0);
+            if (!user?.signerUuid || user.signerStatus !== 'approved') {
+                await ctx.reply("You need an approved signer first. Use /start to set one up.");
+                return;
+            }
+
+            // Get the caption or use an empty string
+            const text = ctx.message.caption || "";
+            
+            // Get the largest photo (last in the array)
+            const photos = ctx.message.photo;
+            const fileId = photos[photos.length - 1].file_id;
+            
+            await ctx.reply("Uploading image and publishing cast...");
+            
+            // Import the image upload function
+            const { uploadImageFromTelegram } = await import('./utils/ut/ut');
+            const imageUrl = await uploadImageFromTelegram(fileId);
+            
+            // Publish the cast with image
+            const cast = await neynarClient.publishCast({
+                signerUuid: user.signerUuid,
+                text: text,
+                embeds: [{ url: imageUrl }]
+            });
+
+            // Store the cast hash in Redis
+            await redis.set(`user:${ctx.from?.id}:cast:${cast.cast.hash}`, JSON.stringify({
+                text: text,
+                imageUrl: imageUrl,
+                timestamp: Date.now()
+            }));
+            
+            await ctx.reply("✅ Cast with image published successfully!");
+        } catch (error) {
+            console.error("Error publishing cast with image:", error);
+            await ctx.reply("Sorry, something went wrong while publishing your cast with image.");
+        }
+    }
+});
+
 // Add a periodic check function to update signer statuses automatically
 async function checkAndUpdateAllSignerStatuses() {
     try {
@@ -723,5 +1046,7 @@ async function startBot() {
     
     bot.start();
 }
+
+export default bot;
 
 startBot();
