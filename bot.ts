@@ -1,11 +1,9 @@
 import { Bot } from "grammy";
 import { botToken } from "./config";
-import { getFyFeed, createSigner, getSigner } from "./utils/fc/config";
+import { getFyFeed } from "./utils/fc/config";
 import { db, redis } from "./utils/db/redis";
 import { createSignedKey, getSignerUUID, verifySignerStatus, checkSigner, resetSigner } from './utils/fc/signer';
 import neynarClient from "./utils/fc/neynarClient";
-
-
 
 const bot = new Bot(botToken);
 
@@ -35,11 +33,11 @@ bot.use(async (ctx, next) => {
     await next();
 });
 
-// Modify sendCast to include inline keyboard
+// Modify sendCast to include inline keyboard and media embeds
 async function sendCast(ctx: any, cast: any) {
     const text = cast.text;
     const author = cast.author;
-    const castMedia = cast.embeds[0]
+    const castMedia = cast.embeds?.[0]; // Get the first embed if available
     const displayName = author.display_name || author.username;
     const pfp_url = author.pfp_url;
     
@@ -65,22 +63,64 @@ async function sendCast(ctx: any, cast: any) {
         ]]
     };
 
-    if (pfp_url) {
-        try {
-            await ctx.replyWithPhoto(pfp_url, {
-                caption: message,
-                parse_mode: "HTML",
-                width: 100,
-                height: 100,
-                reply_markup: keyboard
-            });
-        } catch (e) {
+    try {
+        // Check if there's a media embed
+        if (castMedia) {
+            console.log("Cast has media:", castMedia);
+            
+            // Handle image embeds
+            if (castMedia.url && (castMedia.url.endsWith('.jpg') || castMedia.url.endsWith('.jpeg') || 
+                                  castMedia.url.endsWith('.png') || castMedia.url.endsWith('.gif'))) {
+                await ctx.replyWithPhoto(castMedia.url, {
+                    caption: message,
+                    parse_mode: "HTML",
+                    reply_markup: keyboard
+                });
+                return;
+            }
+            
+            // Handle video embeds - Telegram supports MP4 files
+            if (castMedia.url && (castMedia.url.endsWith('.mp4') || castMedia.url.endsWith('.mov'))) {
+                await ctx.replyWithVideo(castMedia.url, {
+                    caption: message,
+                    parse_mode: "HTML",
+                    reply_markup: keyboard
+                });
+                return;
+            }
+            
+            // For other types of embeds (URLs, etc.), add the URL to the message
+            if (castMedia.url) {
+                message += `\n\n<a href="${castMedia.url}">View attached content</a>`;
+            }
+        }
+        
+        // Default case: use profile picture
+        if (pfp_url) {
+            try {
+                await ctx.replyWithPhoto(pfp_url, {
+                    caption: message,
+                    parse_mode: "HTML",
+                    width: 100,
+                    height: 100,
+                    reply_markup: keyboard
+                });
+            } catch (e) {
+                console.error("Failed to send with profile photo:", e);
+                await ctx.reply(message, { 
+                    parse_mode: "HTML",
+                    reply_markup: keyboard
+                });
+            }
+        } else {
             await ctx.reply(message, { 
                 parse_mode: "HTML",
                 reply_markup: keyboard
             });
         }
-    } else {
+    } catch (error) {
+        console.error("Error sending cast with media:", error);
+        // Fallback to simple text message
         await ctx.reply(message, { 
             parse_mode: "HTML",
             reply_markup: keyboard
@@ -232,17 +272,23 @@ bot.command("check_approval", async (ctx) => {
 bot.command("update_signer", async (ctx) => {
     console.log("update_signer command received");
     try {
+        const user = await db.getUser(ctx.from?.id || 0);
+        if (!user?.signerUuid) {
+            await ctx.reply("No signer found. Please use /start to set up a new signer.");
+            return;
+        }
+
         await ctx.reply("Updating signer information in database...");
         
-        const userData = {
-            chatId: ctx.from?.id || 0,
-            fid: 0, /**@dev Replace with your FID */
-            signerUuid: 'your-signer-uuid', /**@dev Replace with your signer UUID */
-            signerStatus: 'approved' as const
-        };
+        // Get current status from Neynar
+        const signer = await neynarClient.lookupSigner({ 
+            signerUuid: user.signerUuid 
+        });
         
-        await db.saveUser(ctx.from?.id || 0, userData);
-        await ctx.reply("✅ Updated database with approved signer!");
+        // Update the status in the database
+        await db.updateSignerStatus(ctx.from?.id || 0, signer.status);
+        
+        await ctx.reply("✅ Updated database with current signer status!");
         
         const saved = await db.getUser(ctx.from?.id || 0);
         await ctx.reply(
@@ -259,9 +305,21 @@ bot.command("update_signer", async (ctx) => {
 
 bot.command("check_signer", async (ctx) => {
     try {
+        const user = await db.getUser(ctx.from?.id || 0);
+        if (!user?.signerUuid) {
+            await ctx.reply("No signer found. Please use /start to set up a new signer.");
+            return;
+        }
+
         await ctx.reply("Checking existing signer...");
         
-        const signer = await checkSigner('your-signer-uuid'); /**@dev Replace with your signer UUID */
+        const signer = await checkSigner(user.signerUuid);
+        
+        // Update database if status has changed
+        if (user.signerStatus !== signer.status) {
+            await db.updateSignerStatus(ctx.from?.id || 0, signer.status);
+        }
+        
         await ctx.reply(`Signer status: ${signer.status}`);
     } catch (error) {
         console.error("Error checking signer:", error);
@@ -314,12 +372,24 @@ bot.command("list_signers", async (ctx) => {
 bot.command("check_approved_signer", async (ctx) => {
     console.log("check_approved_signer command received");
     try {
-        await ctx.reply("Checking our approved signer...");
+        const user = await db.getUser(ctx.from?.id || 0);
+        if (!user?.signerUuid) {
+            await ctx.reply("No signer found. Please use /start to set up a new signer.");
+            return;
+        }
+
+        await ctx.reply("Checking your signer...");
         console.log("Sending lookup request for signer");
         const signer = await neynarClient.lookupSigner({ 
-            signerUuid: 'your-signer-uuid' /**@dev Replace with your signer UUID */
+            signerUuid: user.signerUuid
         });
         console.log("Got signer response:", signer);
+        
+        // Update the status in the database if it has changed
+        if (user.signerStatus !== signer.status) {
+            await db.updateSignerStatus(ctx.from?.id || 0, signer.status);
+        }
+        
         await ctx.reply(
             `Signer status:\n` +
             `Status: ${signer.status}\n` +
@@ -497,6 +567,10 @@ bot.on("message", async (ctx) => {
         
         if (existingSignerUUID) {
             const status = await verifySignerStatus(existingSignerUUID);
+            
+            // Update the database with the current status
+            await db.updateSignerStatus(ctx.from.id, status || 'pending_approval');
+            
             if (status === 'approved') {
                 // Update the FID for the existing user
                 const userData = await db.getUser(ctx.from.id);
@@ -506,8 +580,48 @@ bot.on("message", async (ctx) => {
                     await ctx.reply("Updated your FID! You can now use /feed to see your Farcaster feed.");
                 }
                 return;
+            } else if (status === 'pending_approval') {
+                // Get the approval URL again
+                const signer = await neynarClient.lookupSigner({ 
+                    signerUuid: existingSignerUUID 
+                });
+                
+                await ctx.reply("You still have a pending approval. Please approve in Warpcast:");
+                await ctx.reply(signer.signer_approval_url || "No approval URL found");
+                
+                // Set up the same approval checking as for new users
+                await ctx.reply("I'll check for your approval. This may take a moment...");
+                
+                // Start polling for approval (same code as for new signers)
+                const pollInterval = 10000;
+                const maxAttempts = 12;
+                let attempts = 0;
+
+                const checkApprovalStatus = async () => {
+                    attempts++;
+                    const currentStatus = await verifySignerStatus(existingSignerUUID);
+                    
+                    if (currentStatus) {
+                        await db.updateSignerStatus(ctx.from.id, currentStatus);
+                    }
+                    
+                    if (currentStatus === 'approved') {
+                        await ctx.reply("✅ Great! Your connection is approved. You can now use /feed to see your Farcaster feed!");
+                        return;
+                    }
+                    
+                    if (attempts >= maxAttempts) {
+                        await ctx.reply("I haven't detected your approval yet. You can approve anytime and then use /check_approval to verify.");
+                        return;
+                    }
+                    
+                    setTimeout(checkApprovalStatus, pollInterval);
+                };
+
+                setTimeout(checkApprovalStatus, pollInterval);
+                return;
             }
-            // If not approved, continue with new signer creation
+            // If not approved or pending_approval, continue with new signer creation
         }
 
         // Create new signer with signed key
@@ -530,18 +644,38 @@ bot.on("message", async (ctx) => {
             });
             await ctx.reply(signer.approval_url);
             
-            // Set up a check for approval
-            await ctx.reply("I'll check for your approval in a moment...");
-            
-            // Wait a bit and check status
-            setTimeout(async () => {
-                const status = await verifySignerStatus(signer.signer_uuid);
-                if (status === 'approved') {
-                    await ctx.reply("Great! Your connection is approved. You can now use /feed to see your Farcaster feed!");
-                } else {
-                    await ctx.reply("I haven't detected your approval yet. Please approve the connection in Warpcast and then try /start again.");
+            await ctx.reply("I'll check for your approval. This may take a moment...");
+
+            // Set up polling to check approval status
+            const pollInterval = 10000; // 10 seconds
+            const maxAttempts = 12; // Try for 2 minutes total (12 * 10s)
+            let attempts = 0;
+
+            const checkApprovalStatus = async () => {
+                attempts++;
+                const currentStatus = await verifySignerStatus(signer.signer_uuid);
+                
+                // Update the status in the database
+                if (currentStatus) {
+                    await db.updateSignerStatus(ctx.from.id, currentStatus);
                 }
-            }, 30000); // Wait 30 seconds before checking
+                
+                if (currentStatus === 'approved') {
+                    await ctx.reply("✅ Great! Your connection is approved. You can now use /feed to see your Farcaster feed!");
+                    return;
+                }
+                
+                if (attempts >= maxAttempts) {
+                    await ctx.reply("I haven't detected your approval yet. You can approve anytime and then use /check_approval to verify or /get_approval_link to get the link again.");
+                    return;
+                }
+                
+                // Continue polling
+                setTimeout(checkApprovalStatus, pollInterval);
+            };
+
+            // Start the polling
+            setTimeout(checkApprovalStatus, pollInterval);
         } else {
             await ctx.reply("Sorry, something went wrong while setting up your Farcaster connection.");
         }
@@ -551,33 +685,42 @@ bot.on("message", async (ctx) => {
     }
 });
 
-// Keep feed check interval outside startBot
-setInterval(async () => {
-    const users = await db.getAllUsers();
-    for (const user of users) {
-        if (user.signerStatus === 'approved') {
-            try {
-                const casts = await getFyFeed(user.fid);
-                if (casts.length > 0) {
-                    await bot.api.sendMessage(user.chatId, "🔄 New casts from your feed:");
-                    for (const cast of casts.slice(0, 10)) {
-                        await sendCast({ 
-                            reply: (msg: string, opts: any) => bot.api.sendMessage(user.chatId, msg, opts),
-                            replyWithPhoto: (photo: string, opts: any) => bot.api.sendPhoto(user.chatId, photo, opts)
-                        }, cast);
+// Add a periodic check function to update signer statuses automatically
+async function checkAndUpdateAllSignerStatuses() {
+    try {
+        console.log("Running automatic signer status check...");
+        const users = await db.getAllUsers();
+        
+        for (const user of users) {
+            if (user.signerUuid && user.signerStatus !== 'approved') {
+                try {
+                    const signer = await neynarClient.lookupSigner({ 
+                        signerUuid: user.signerUuid 
+                    });
+                    
+                    if (user.signerStatus !== signer.status) {
+                        console.log(`Updating status for user ${user.chatId}: ${user.signerStatus} -> ${signer.status}`);
+                        await db.updateSignerStatus(user.chatId, signer.status);
                     }
+                } catch (error) {
+                    console.error(`Error checking signer for user ${user.chatId}:`, error);
                 }
-            } catch (error) {
-                console.error(`Error fetching feed for chat ${user.chatId}:`, error);
             }
         }
+    } catch (error) {
+        console.error("Error in automatic status check:", error);
     }
-}, 5 * 60 * 1000);
+}
 
+// Update the startBot function to include periodic checking
 async function startBot() {
     await bot.api.deleteWebhook({ drop_pending_updates: true });
     console.log("Cleared pending updates");
     console.log("Starting bot...");
+    
+    // Run the status check every 5 minutes
+    setInterval(checkAndUpdateAllSignerStatuses, 5 * 60 * 1000);
+    
     bot.start();
 }
 
