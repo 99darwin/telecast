@@ -1,6 +1,6 @@
 import { Bot } from "grammy";
 import { botToken } from "./config";
-import { getFyFeed, getCastWithReplies, getCastReplies, getCastConversation, getCastByHash } from "./utils/fc/config";
+import { getFyFeed, getCastWithReplies, getCastReplies, getCastConversation, getCastByHash, getUserNotifications } from "./utils/fc/config";
 import { db, redis } from "./utils/db/redis";
 import { createSignedKey, getSignerUUID, verifySignerStatus, checkSigner, resetSigner } from './utils/fc/signer';
 import neynarClient from "./utils/fc/neynarClient";
@@ -128,11 +128,155 @@ async function sendCast(ctx: any, cast: any) {
     }
 }
 
-// Find the existing callback query handler and update it to handle the "load_more" action
+// Find the existing callback query handler and update it to handle both "load_more" and "notifications" actions
 bot.on("callback_query", async (ctx) => {
     try {
         const callbackData = ctx.callbackQuery?.data;
         if (!callbackData) return;
+        
+        // Handle notifications pagination
+        if (callbackData.startsWith('notif:')) {
+            const shortId = callbackData.split(':')[1];
+            // Get the actual cursor from Redis
+            const cursor = await redis.get(`cursor:${shortId}`);
+            if (!cursor) {
+                await ctx.reply("This notification link has expired. Please run /notifications again.");
+                return;
+            }
+            
+            // After using the cursor, we can clean up
+            await redis.del(`cursor:${shortId}`);
+            
+            await ctx.answerCallbackQuery("Loading more notifications...");
+            
+            const user = await db.getUser(ctx.from?.id || 0);
+            if (!user?.fid) {
+                await ctx.reply("No FID found. Please set up your account first with /start");
+                return;
+            }
+            
+            // Get the notification types filter from Redis
+            let notificationTypes: string[] = ['follows', 'recasts', 'likes', 'mentions', 'replies', 'quotes'];
+            const typesJson = await redis.get(`user:${ctx.from?.id}:notifications_types`);
+            if (typesJson) {
+                try {
+                    notificationTypes = JSON.parse(typesJson);
+                } catch (e) {
+                    console.error("Error parsing notification types:", e);
+                }
+            }
+            
+            // Fetch the next page of notifications with the same types
+            const notifications = await getUserNotifications(user.fid, cursor, notificationTypes);
+            
+            if (!notifications.notifications || notifications.notifications.length === 0) {
+                await ctx.reply("No more notifications found.");
+                return;
+            }
+            
+            await ctx.reply("📱 More notifications:");
+            
+            // Process and display the notifications by type
+            for (const notification of notifications.notifications) {
+                // Display header based on notification type
+                let headerText = "";
+                switch (notification.type) {
+                    case "follows":
+                        headerText = "👥 New follower" + (notification.follows?.length > 1 ? "s" : "");
+                        break;
+                    case "cast-mention":
+                    case "mentions":
+                        headerText = "🔄 You were mentioned in a cast";
+                        break;
+                    case "likes":
+                        headerText = "❤️ Your cast received like" + (notification.count > 1 ? "s" : "");
+                        break;
+                    case "recasts":
+                        headerText = "🔄 Your cast was recasted";
+                        break;
+                    case "replies":
+                        headerText = "💬 New repl" + (notification.count > 1 ? "ies" : "y") + " to your cast";
+                        break;
+                    case "quotes":
+                        headerText = "💬 Your cast was quoted";
+                        break;
+                    default:
+                        headerText = "📢 New notification";
+                }
+                
+                await ctx.reply(`${headerText} • ${new Date(notification.most_recent_timestamp).toLocaleString()}`);
+                
+                // Handle different notification types
+                if (notification.type === "follows" && notification.follows) {
+                    // Display followers
+                    for (const follower of notification.follows) {
+                        if (follower.user) {
+                            const displayName = follower.user.display_name || follower.user.username;
+                            const username = follower.user.username;
+                            const pfpUrl = follower.user.pfp_url;
+                            
+                            let message = `<b>${displayName}</b> (@${username}) started following you`;
+                            
+                            // If we have a profile pic, display it
+                            if (pfpUrl) {
+                                try {
+                                    await ctx.replyWithPhoto(pfpUrl, {
+                                        caption: message,
+                                        parse_mode: "HTML"
+                                    });
+                                } catch (e) {
+                                    console.error("Failed to send with profile photo:", e);
+                                    await ctx.reply(message, { parse_mode: "HTML" });
+                                }
+                            } else {
+                                await ctx.reply(message, { parse_mode: "HTML" });
+                            }
+                        }
+                    }
+                } else if (notification.cast) {
+                    // For cast-related notifications (mentions, quotes, etc.), display the cast
+                    await sendCast(ctx, notification.cast);
+                } else if (notification.reactions && notification.reactions.length > 0) {
+                    // For reaction notifications, show who reacted and the cast
+                    for (const reaction of notification.reactions) {
+                        if (reaction.user) {
+                            const displayName = reaction.user.display_name || reaction.user.username;
+                            await ctx.reply(`${displayName} reacted to your cast`);
+                        }
+                        
+                        // If we have the cast that was reacted to, show it
+                        if (reaction.cast) {
+                            // Fetch the full cast details
+                            const fullCast = await getCastByHash(reaction.cast.hash);
+                            if (fullCast) {
+                                await sendCast(ctx, fullCast);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // If there's a next page of notifications
+            if (notifications.next?.cursor) {
+                // Store the notification types along with the cursor
+                await redis.set(`user:${ctx.from?.id}:notifications_types`, JSON.stringify(notificationTypes));
+                
+                // Generate a short random ID to use as a reference
+                const shortId = Math.random().toString(36).substring(2, 10); // 8 char random string
+                await redis.set(`cursor:${shortId}`, notifications.next.cursor);
+                
+                await ctx.reply("Want to see more notifications?", {
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: "Load More Notifications", callback_data: `notif:${shortId}` }
+                        ]]
+                    }
+                });
+                
+                // Store the cursor in Redis (keeping this for backward compatibility)
+                await redis.set(`user:${ctx.from?.id}:notifications_cursor`, notifications.next.cursor);
+            }
+        }
         
         // Handle the load_more action
         if (callbackData.startsWith('load_more:')) {
@@ -540,6 +684,168 @@ bot.command("get_approval_link", async (ctx) => {
         await ctx.reply("Sorry, something went wrong while getting the approval link.");
     }
 });
+
+bot.command("notifications", async (ctx) => {
+    console.log("/notifications command received from", ctx.from?.id);
+    try {
+        const user = await db.getUser(ctx.from?.id || 0);
+        if (!user?.fid) {
+            await ctx.reply("No FID found. Please set up your account first with /start");
+            return;
+        }
+
+        if (!user?.signerUuid || user.signerStatus !== 'approved') {
+            await ctx.reply("You need an approved signer first. Use /start to set one up.");
+            return;
+        }
+
+        // Extract filter types from command if provided
+        // Example: /notifications mentions,replies
+        let notificationTypes: string[] = ['follows', 'recasts', 'likes', 'mentions', 'replies', 'quotes'];
+        const commandArgs = ctx.message?.text?.slice(14).trim();
+        
+        if (commandArgs) {
+            const requestedTypes = commandArgs.split(',').map(t => t.trim().toLowerCase());
+            const validTypes = ['follows', 'recasts', 'likes', 'mentions', 'replies', 'quotes'];
+            
+            // Filter to only valid notification types
+            const filteredTypes = requestedTypes.filter(t => validTypes.includes(t));
+            
+            if (filteredTypes.length > 0) {
+                notificationTypes = filteredTypes;
+                await ctx.reply(`Fetching your ${filteredTypes.join(', ')} notifications...`);
+            } else {
+                await ctx.reply("Invalid notification types. Fetching all notifications...");
+            }
+        } else {
+            await ctx.reply("Fetching your notifications...");
+        }
+        
+        const notifications = await getUserNotifications(user.fid, '', notificationTypes);
+        console.log("Notifications:", notifications);
+
+        if (!notifications.notifications || notifications.notifications.length === 0) {
+            await ctx.reply("No notifications found.");
+            return;
+        }
+        
+        // Display unread count if available
+        if (notifications.unseen_notifications_count) {
+            await ctx.reply(`📬 You have ${notifications.unseen_notifications_count} unread notifications.`);
+        }
+        
+        // Display the type filter that was applied
+        if (notificationTypes.length < 6) {
+            await ctx.reply(`Showing ${notificationTypes.join(', ')} notifications.`);
+        }
+        
+        // Process and display the notifications by type
+        for (const notification of notifications.notifications) {
+            // Display header based on notification type
+            let headerText = "";
+            switch (notification.type) {
+                case "follows":
+                    headerText = "👥 New follower" + (notification.follows?.length > 1 ? "s" : "");
+                    break;
+                case "cast-mention":
+                case "mentions":
+                    headerText = "🔄 You were mentioned in a cast";
+                    break;
+                case "likes":
+                    headerText = "❤️ Your cast received like" + (notification.count > 1 ? "s" : "");
+                    break;
+                case "recasts":
+                    headerText = "🔄 Your cast was recasted";
+                    break;
+                case "replies":
+                    headerText = "💬 New repl" + (notification.count > 1 ? "ies" : "y") + " to your cast";
+                    break;
+                case "quotes":
+                    headerText = "💬 Your cast was quoted";
+                    break;
+                default:
+                    headerText = "📢 New notification";
+            }
+            
+            await ctx.reply(`${headerText} • ${new Date(notification.most_recent_timestamp).toLocaleString()}`);
+            
+            // Handle different notification types
+            if (notification.type === "follows" && notification.follows) {
+                // Display followers
+                for (const follower of notification.follows) {
+                    if (follower.user) {
+                        const displayName = follower.user.display_name || follower.user.username;
+                        const username = follower.user.username;
+                        const pfpUrl = follower.user.pfp_url;
+                        
+                        let message = `<b>${displayName}</b> (@${username}) started following you`;
+                        
+                        // If we have a profile pic, display it
+                        if (pfpUrl) {
+                            try {
+                                await ctx.replyWithPhoto(pfpUrl, {
+                                    caption: message,
+                                    parse_mode: "HTML"
+                                });
+                            } catch (e) {
+                                console.error("Failed to send with profile photo:", e);
+                                await ctx.reply(message, { parse_mode: "HTML" });
+                            }
+                        } else {
+                            await ctx.reply(message, { parse_mode: "HTML" });
+                        }
+                    }
+                }
+            } else if (notification.cast) {
+                // For cast-related notifications, display the cast
+                await sendCast(ctx, notification.cast);
+            } else if (notification.reactions && notification.reactions.length > 0) {
+                // For reaction notifications, show who reacted and the cast
+                for (const reaction of notification.reactions) {
+                    if (reaction.user) {
+                        const displayName = reaction.user.display_name || reaction.user.username;
+                        await ctx.reply(`${displayName} reacted to your cast`);
+                    }
+                    
+                    // If we have the cast that was reacted to, show it
+                    if (reaction.cast) {
+                        // Fetch the full cast details
+                        const fullCast = await getCastByHash(reaction.cast.hash);
+                        if (fullCast) {
+                            await sendCast(ctx, fullCast);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If there's a next page of notifications
+        if (notifications.next?.cursor) {
+            // Store the notification types along with the cursor
+            await redis.set(`user:${ctx.from?.id}:notifications_types`, JSON.stringify(notificationTypes));
+            
+            // Generate a short random ID to use as a reference
+            const shortId = Math.random().toString(36).substring(2, 10); // 8 char random string
+            await redis.set(`cursor:${shortId}`, notifications.next.cursor);
+            
+            await ctx.reply("Want to see more notifications?", {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: "Load More Notifications", callback_data: `notif:${shortId}` }
+                    ]]
+                }
+            });
+            
+            // Store the cursor in Redis (keeping this for backward compatibility)
+            await redis.set(`user:${ctx.from?.id}:notifications_cursor`, notifications.next.cursor);
+        }
+
+    } catch (error) {
+        console.error("Error fetching notifications:", error);
+        await ctx.reply("Sorry, something went wrong while fetching notifications.");
+    }
+});
+
 
 bot.command("replies", async (ctx) => {
   console.log("/replies command received from", ctx.from?.id);

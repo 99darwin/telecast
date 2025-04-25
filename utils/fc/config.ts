@@ -355,4 +355,35 @@ export const getCastByHash = async (castHash: string): Promise<any> => {
     }
 };
 
+// Updated function to support filtering notifications by type
+export const getUserNotifications = async (
+    fid: number, 
+    cursor: string = '', 
+    types: string[] = ['follows', 'recasts', 'likes', 'mentions', 'replies', 'quotes']
+) => {
+    try {
+        // Join the types with commas for the query parameter
+        const typeParam = types.join(',');
+        
+        // Construct the URL with the specified types
+        const url = `${neynarApiUrl}/farcaster/notifications?fid=${fid}&type=${typeParam}&limit=15&cursor=${cursor}`;
+        
+        console.log(`Fetching notifications: ${url}`);
+        const response = await fetch(url, neynarHeaders('GET'));
+        
+        if (!response.ok) {
+            console.error(`Notifications API Error: ${response.status} ${response.statusText}`);
+            const errorText = await response.text();
+            console.error('Error response:', errorText);
+            return { notifications: [] };
+        }
+        
+        const data = await response.json();
+        return data;
+    } catch (error) {
+        console.error('Error fetching user notifications:', error);
+        return { notifications: [] };
+    }
+}
+
 
