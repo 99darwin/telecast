@@ -236,8 +236,8 @@ bot.command("update_signer", async (ctx) => {
         
         const userData = {
             chatId: ctx.from?.id || 0,
-            fid: 269091,
-            signerUuid: '7b76b07f-19c0-4489-95ec-137b02a0b915',
+            fid: 0, /**@dev Replace with your FID */
+            signerUuid: 'your-signer-uuid', /**@dev Replace with your signer UUID */
             signerStatus: 'approved' as const
         };
         
@@ -261,7 +261,7 @@ bot.command("check_signer", async (ctx) => {
     try {
         await ctx.reply("Checking existing signer...");
         
-        const signer = await checkSigner('7b76b07f-19c0-4489-95ec-137b02a0b915');
+        const signer = await checkSigner('your-signer-uuid'); /**@dev Replace with your signer UUID */
         await ctx.reply(`Signer status: ${signer.status}`);
     } catch (error) {
         console.error("Error checking signer:", error);
@@ -317,7 +317,7 @@ bot.command("check_approved_signer", async (ctx) => {
         await ctx.reply("Checking our approved signer...");
         console.log("Sending lookup request for signer");
         const signer = await neynarClient.lookupSigner({ 
-            signerUuid: '7b76b07f-19c0-4489-95ec-137b02a0b915'
+            signerUuid: 'your-signer-uuid' /**@dev Replace with your signer UUID */
         });
         console.log("Got signer response:", signer);
         await ctx.reply(
@@ -340,7 +340,7 @@ bot.command("get_approval_link", async (ctx) => {
         }
 
         const signer = await neynarClient.lookupSigner({ 
-            signerUuid: user.signerUuid 
+            signerUuid: user.signerUuid /**@dev Replace with your signer UUID */
         });
 
         if (signer.status === 'approved') {
