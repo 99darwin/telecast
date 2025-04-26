@@ -68,62 +68,41 @@ async function sendCast(ctx: any, cast: any) {
         if (castMedia) {
             console.log("Cast has media:", castMedia);
             
-            // Handle image embeds
-            if (castMedia.url && (castMedia.url.endsWith('.jpg') || castMedia.url.endsWith('.jpeg') || 
-                                  castMedia.url.endsWith('.png') || castMedia.url.endsWith('.gif'))) {
-                await ctx.replyWithPhoto(castMedia.url, {
-                    caption: message,
-                    parse_mode: "HTML",
-                    reply_markup: keyboard
-                });
-                return;
+            // For image and video embeds, don't load them automatically
+            if (castMedia.url && (
+                castMedia.url.endsWith('.jpg') || 
+                castMedia.url.endsWith('.jpeg') || 
+                castMedia.url.endsWith('.png') || 
+                castMedia.url.endsWith('.gif') ||
+                castMedia.url.endsWith('.mp4') || 
+                castMedia.url.endsWith('.mov')
+            )) {
+                message += `\n\n<a href="${castMedia.url}">View attached media</a>`;
             }
-            
-            // Handle video embeds - Telegram supports MP4 files
-            if (castMedia.url && (castMedia.url.endsWith('.mp4') || castMedia.url.endsWith('.mov'))) {
-                await ctx.replyWithVideo(castMedia.url, {
-                    caption: message,
-                    parse_mode: "HTML",
-                    reply_markup: keyboard
-                });
-                return;
-            }
-            
             // For other types of embeds (URLs, etc.), add the URL to the message
-            if (castMedia.url) {
+            else if (castMedia.url) {
                 message += `\n\n<a href="${castMedia.url}">View attached content</a>`;
             }
         }
         
-        // Default case: use profile picture
+        // Add profile picture link if available
         if (pfp_url) {
-            try {
-                await ctx.replyWithPhoto(pfp_url, {
-                    caption: message,
-                    parse_mode: "HTML",
-                    width: 100,
-                    height: 100,
-                    reply_markup: keyboard
-                });
-            } catch (e) {
-                console.error("Failed to send with profile photo:", e);
-                await ctx.reply(message, { 
-                    parse_mode: "HTML",
-                    reply_markup: keyboard
-                });
-            }
-        } else {
-            await ctx.reply(message, { 
-                parse_mode: "HTML",
-                reply_markup: keyboard
-            });
+            message += `\n<a href="${pfp_url}">View profile picture</a>`;
         }
+        
+        // Always use text-only message
+        await ctx.reply(message, { 
+            parse_mode: "HTML",
+            reply_markup: keyboard,
+            disable_web_page_preview: true
+        });
     } catch (error) {
-        console.error("Error sending cast with media:", error);
+        console.error("Error sending cast:", error);
         // Fallback to simple text message
         await ctx.reply(message, { 
             parse_mode: "HTML",
-            reply_markup: keyboard
+            reply_markup: keyboard,
+            disable_web_page_preview: true
         });
     }
 }
@@ -217,20 +196,15 @@ bot.on("callback_query", async (ctx) => {
                             
                             let message = `<b>${displayName}</b> (@${username}) started following you`;
                             
-                            // If we have a profile pic, display it
+                            // Add profile picture link if available
                             if (pfpUrl) {
-                                try {
-                                    await ctx.replyWithPhoto(pfpUrl, {
-                                        caption: message,
-                                        parse_mode: "HTML"
-                                    });
-                                } catch (e) {
-                                    console.error("Failed to send with profile photo:", e);
-                                    await ctx.reply(message, { parse_mode: "HTML" });
-                                }
-                            } else {
-                                await ctx.reply(message, { parse_mode: "HTML" });
+                                message += `\n<a href="${pfpUrl}">View profile picture</a>`;
                             }
+                            
+                            // Always use text-only message
+                            await ctx.reply(message, { 
+                                parse_mode: "HTML"
+                            });
                         }
                     }
                 } else if (notification.cast) {
@@ -780,20 +754,15 @@ bot.command("notifications", async (ctx) => {
                         
                         let message = `<b>${displayName}</b> (@${username}) started following you`;
                         
-                        // If we have a profile pic, display it
+                        // Add profile picture link if available
                         if (pfpUrl) {
-                            try {
-                                await ctx.replyWithPhoto(pfpUrl, {
-                                    caption: message,
-                                    parse_mode: "HTML"
-                                });
-                            } catch (e) {
-                                console.error("Failed to send with profile photo:", e);
-                                await ctx.reply(message, { parse_mode: "HTML" });
-                            }
-                        } else {
-                            await ctx.reply(message, { parse_mode: "HTML" });
+                            message += `\n<a href="${pfpUrl}">View profile picture</a>`;
                         }
+                        
+                        // Always use text-only message
+                        await ctx.reply(message, { 
+                            parse_mode: "HTML"
+                        });
                     }
                 }
             } else if (notification.cast) {
