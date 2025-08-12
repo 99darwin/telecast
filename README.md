@@ -1,9 +1,6 @@
 # What is this
 Interact with Farcaster from Telegram
 
-# Warning
-The bot I built was banned when I ran this code. I'm putting it out there in the hopes that someone else will run it because I really wanted to use Farcaster from Telegram. **Use at your own risk.**
-
 # Configuration
 Configure the environment variables. 
 `cp env.example .env.local`
